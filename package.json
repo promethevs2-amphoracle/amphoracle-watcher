@@ -1,0 +1,19 @@
+{
+  "name": "amphoracle-watcher-server",
+  "version": "2.0.0",
+  "description": "Amphoracle Oracle Watcher Server — fetches live web content 60s before reveal and delivers Oracle verdicts at the exact moment the countdown hits zero",
+  "type": "module",
+  "main": "amphoracle-watcher-server.js",
+  "scripts": {
+    "start": "node amphoracle-watcher-server.js",
+    "dev": "node --watch amphoracle-watcher-server.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "cheerio": "^1.0.0",
+    "express": "^4.18.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
