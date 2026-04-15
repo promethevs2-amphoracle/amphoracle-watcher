@@ -297,7 +297,7 @@ async function lockWhisper(watcher, verdict, confidence, reasoning, evidence) {
     whisper_id,
     whisper_title,
     "oracle_locked",
-    `U0001F512 The Oracle has found the answer. The Chamber opens in 15 minutes. Be present for the reveal.`
+    `🔒 The Oracle has found the answer. The Chamber opens in 15 minutes. Be present for the reveal.`
   );
 
   // Schedule reveal in 15 minutes
