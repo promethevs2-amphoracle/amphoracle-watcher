@@ -117,6 +117,62 @@ async function callClaude(systemPrompt, userMessage, maxTokens = 800) {
 }
 
 // ─── BASE44 HELPERS ──────────────────────────────────────────
+
+// Post a single notification record
+async function createNotification(userEmail, type, message, whisperId) {
+  const body = JSON.stringify({
+    user_email: userEmail,
+    type,
+    message,
+    whisper_id: whisperId,
+    is_read: false
+  });
+  try {
+    await httpRequest({
+      protocol: "https:",
+      hostname: "api.base44.com",
+      path: "/api/apps/69d1545f93121e831922ce33/entities/Notification",
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": BASE44_KEY,
+        "Content-Length": Buffer.byteLength(body)
+      }
+    }, body);
+  } catch(e) {
+    console.log(`[NOTIFY] Failed to create notification for ${userEmail}:`, e.message);
+  }
+}
+
+// Get all voters for a whisper
+async function getVotersForWhisper(whisperId) {
+  try {
+    const res = await httpRequest({
+      protocol: "https:",
+      hostname: "api.base44.com",
+      path: `/api/apps/69d1545f93121e831922ce33/entities/WhisperVote?whisper_id=${whisperId}&limit=500`,
+      method: "GET",
+      headers: { "x-api-key": BASE44_KEY }
+    });
+    return (res.data && res.data.entities) || [];
+  } catch(e) {
+    console.log(`[NOTIFY] Failed to get voters for whisper ${whisperId}:`, e.message);
+    return [];
+  }
+}
+
+// Notify all voters of a whisper
+async function notifyAllVoters(whisperId, whisperTitle, type, message) {
+  const voters = await getVotersForWhisper(whisperId);
+  if (!voters.length) return;
+  console.log(`[NOTIFY] Sending ${type} to ${voters.length} voters for "${whisperTitle}"`);
+  for (const voter of voters) {
+    if (voter.voter_email) {
+      await createNotification(voter.voter_email, type, message, whisperId);
+    }
+  }
+}
+
 async function patchBase44(entity, id, payload) {
   const body = JSON.stringify(payload);
   return httpRequest({
@@ -235,6 +291,15 @@ async function lockWhisper(watcher, verdict, confidence, reasoning, evidence) {
     reveal_scheduled_for: new Date(Date.now() + LOCK_TO_REVEAL_MS).toISOString()
   });
 
+
+  // Notify all voters — Oracle has locked, reveal in 15 min
+  await notifyAllVoters(
+    whisper_id,
+    whisper_title,
+    "oracle_locked",
+    `U0001F512 The Oracle has found the answer. The Chamber opens in 15 minutes. Be present for the reveal.`
+  );
+
   // Schedule reveal in 15 minutes
   const timer = setTimeout(() => executeReveal(watcher, verdict, confidence, reasoning), LOCK_TO_REVEAL_MS);
   revealTimers.set(whisper_id, timer);
@@ -262,6 +327,15 @@ async function executeReveal(watcher, verdict, confidence, reasoning) {
       revealed_at: ts
     })
   ]);
+
+  // Notify all voters — verdict is in
+  const verdictUpper = verdict.toUpperCase();
+  await notifyAllVoters(
+    whisper_id,
+    whisper_title,
+    "oracle_revealed",
+    `🏺 The Oracle has spoken. Enter the Chamber to witness the verdict on "${whisper_title.slice(0, 50)}..."`
+  );
 
   locked.delete(whisper_id);
   revealTimers.delete(whisper_id);
