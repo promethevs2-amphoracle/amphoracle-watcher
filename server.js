@@ -211,6 +211,31 @@ async function getWatchers() {
   return (res.data && res.data.entities) || [];
 }
 
+// List Whispers currently in the lock window (between lock and reveal).
+async function listLockedWhispers() {
+  const res = await _httpRequest({
+    protocol: "https:",
+    hostname: "api.base44.com",
+    path: "/api/apps/69d1545f93121e831922ce33/entities/Whisper?status=locked&limit=100",
+    method: "GET",
+    headers: { "x-api-key": BASE44_KEY }
+  });
+  return (res.data && res.data.entities) || [];
+}
+
+// Find the OracleWatcher for a given whisper_id. Returns null if none.
+async function getWatcherByWhisperId(whisperId) {
+  const res = await _httpRequest({
+    protocol: "https:",
+    hostname: "api.base44.com",
+    path: `/api/apps/69d1545f93121e831922ce33/entities/OracleWatcher?whisper_id=${encodeURIComponent(whisperId)}&limit=1`,
+    method: "GET",
+    headers: { "x-api-key": BASE44_KEY }
+  });
+  const entities = (res.data && res.data.entities) || [];
+  return entities[0] || null;
+}
+
 // ─── DISRUPTION CHECK ────────────────────────────────────────
 async function checkForDisruption(watcher) {
   const { whisper_title, urls, oracle_hint } = watcher;
@@ -352,6 +377,77 @@ async function executeReveal(watcher, verdict, confidence, reasoning) {
   locked.delete(whisper_id);
   revealTimers.delete(whisper_id);
   console.log(`[ORACLE] ✓ Revealed: "${whisper_title}" 🏺\n`);
+}
+
+// ─── BOOT-TIME REVEAL RECOVERY ───────────────────────────────
+// In-memory revealTimers are lost on restart. Without this, any whisper
+// locked before a restart stays locked forever and never reveals.
+async function recoverRevealTimers() {
+  try {
+    const whispers = await listLockedWhispers();
+    if (whispers.length === 0) {
+      console.log("[RECOVERY] No locked whispers to recover");
+      return { recovered: 0, fired: 0, scheduled: 0, skipped: 0 };
+    }
+
+    console.log(`[RECOVERY] Found ${whispers.length} locked whisper(s) to recover`);
+    const now = Date.now();
+    let fired = 0, scheduled = 0, skipped = 0;
+
+    for (const whisper of whispers) {
+      const whisperId = whisper.id;
+
+      if (revealTimers.has(whisperId)) { skipped++; continue; }
+
+      const revealAt = whisper.reveal_scheduled_for ? Date.parse(whisper.reveal_scheduled_for) : NaN;
+      if (!Number.isFinite(revealAt)) {
+        console.log(`[RECOVERY] Whisper ${whisperId} missing reveal_scheduled_for — skipping`);
+        skipped++;
+        continue;
+      }
+
+      const watcher = await getWatcherByWhisperId(whisperId);
+      if (!watcher) {
+        console.log(`[RECOVERY] No watcher for locked whisper ${whisperId} — skipping`);
+        skipped++;
+        continue;
+      }
+
+      const watcherArg = {
+        id: watcher.id,
+        whisper_id: whisperId,
+        whisper_title: whisper.title || watcher.whisper_title || ""
+      };
+      const verdict = watcher.oracle_verdict;
+      const confidence = watcher.oracle_confidence;
+      const reasoning = watcher.oracle_reasoning;
+
+      locked.set(whisperId, Date.parse(whisper.oracle_lock_time) || now);
+
+      const remaining = revealAt - now;
+      if (remaining <= 0) {
+        console.log(`[RECOVERY] Reveal overdue for "${watcherArg.whisper_title}" — firing now`);
+        executeReveal(watcherArg, verdict, confidence, reasoning).catch((e) =>
+          console.error("[RECOVERY] executeReveal error:", e.message)
+        );
+        fired++;
+      } else {
+        console.log(`[RECOVERY] Re-scheduling reveal for "${watcherArg.whisper_title}" in ${Math.round(remaining / 1000)}s`);
+        const timer = setTimeout(
+          () => executeReveal(watcherArg, verdict, confidence, reasoning),
+          remaining
+        );
+        revealTimers.set(whisperId, timer);
+        scheduled++;
+      }
+    }
+
+    console.log(`[RECOVERY] Done — fired: ${fired}, scheduled: ${scheduled}, skipped: ${skipped}`);
+    return { recovered: whispers.length, fired, scheduled, skipped };
+  } catch (e) {
+    console.error("[RECOVERY] Error recovering reveal timers:", e.message);
+    return { recovered: 0, fired: 0, scheduled: 0, skipped: 0, error: e.message };
+  }
 }
 
 // ─── MAIN POLL LOOP ───────────────────────────────────────────
@@ -621,6 +717,7 @@ const PORT = process.env.PORT || 3000;
 // Only auto-start when run directly — not when required from tests.
 if (require.main === module) {
   installProcessGuards();
+  recoverRevealTimers().catch((e) => console.error("[RECOVERY] Boot error:", e.message));
   startBackgroundPolling();
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`\n🏺 Amphoracle Watcher v4.1 — Evidence-Based Oracle — Port ${PORT}`);
@@ -639,6 +736,9 @@ module.exports = {
   notifyAllVoters,
   patchBase44,
   getWatchers,
+  listLockedWhispers,
+  getWatcherByWhisperId,
+  recoverRevealTimers,
   checkForDisruption,
   checkForEvidence,
   lockWhisper,
