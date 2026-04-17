@@ -23,7 +23,7 @@ app.use((req, res, next) => {
 
 const BASE44_API = "https://api.base44.com/api/apps/69d1545f93121e831922ce33/entities";
 const BASE44_KEY = process.env.BASE44_API_KEY;
-const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+const ANTHROPIC_KEY = process.env.amphoracle_railway;
 
 const CONFIDENCE_THRESHOLD = 85; // Oracle locks when >= 85% confident
 const LOCK_TO_REVEAL_MS = 15 * 60 * 1000; // 15 minutes
