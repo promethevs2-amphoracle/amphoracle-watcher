@@ -407,7 +407,27 @@ async function pollWatchers() {
 
 // Start polling
 setInterval(pollWatchers, POLL_INTERVAL_MS);
-setTimeout(pollWatchers, 5000);
+setTimeout(async () => {
+  try {
+    console.log("[STARTUP] Running initial poll...");
+    await pollWatchers();
+  } catch (e) {
+    console.error("[STARTUP] Fatal error during initial poll:", e.message, e.stack);
+    process.exit(1);
+  }
+}, 5000);
+
+// Catch unhandled promise rejections
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("[FATAL] Unhandled rejection:", reason);
+  process.exit(1);
+});
+
+// Catch synchronous uncaught exceptions
+process.on("uncaughtException", (error) => {
+  console.error("[FATAL] Uncaught exception:", error.message, error.stack);
+  process.exit(1);
+});
 
 // ─── ENDPOINTS ────────────────────────────────────────────────
 
@@ -597,4 +617,7 @@ app.get("/", (req, res) => res.json({
 }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, "0.0.0.0", () => console.log(`\n🏺 Amphoracle Watcher v4.1 — Evidence-Based Oracle — Port ${PORT}\n`));
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`\n🏺 Amphoracle Watcher v4.1 — Evidence-Based Oracle — Port ${PORT}`);
+  console.log(`[STARTUP] Server listening on port ${PORT}. Initial poll in 5 seconds...\n`);
+});
