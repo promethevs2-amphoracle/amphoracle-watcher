@@ -12,6 +12,8 @@ const http = require("http");
 const { parseClaudeJSON } = require("./lib/parse-claude-json");
 const { decidePollInterval } = require("./lib/poll-interval");
 const { filterFutureWhispers } = require("./lib/filter-future-whispers");
+const { makeAuthMiddleware } = require("./lib/auth");
+const { makeRateLimit } = require("./lib/rate-limit");
 
 const app = express();
 app.use(express.json());
@@ -28,6 +30,17 @@ app.use((req, res, next) => {
 const BASE44_API = "https://api.base44.com/api/apps/69d1545f93121e831922ce33/entities";
 const BASE44_KEY = process.env.BASE44_API_KEY;
 const ANTHROPIC_KEY = process.env.amphoracle_railway;
+
+// Inbound auth — protects endpoints that spend Anthropic tokens or
+// write to Base44. Fail-open when unset so the env var can be rolled
+// out before the frontend is updated.
+const requireAuth = makeAuthMiddleware(() => process.env.WATCHER_AUTH_KEY);
+
+// Per-IP rate limits — protect against token-spend DoS even if the
+// shared secret leaks. Tuned for expected frontend usage.
+const scoutLimiter = makeRateLimit({ windowMs: 60_000, max: 10 });
+const revealLimiter = makeRateLimit({ windowMs: 60_000, max: 30 });
+const recommendLimiter = makeRateLimit({ windowMs: 60_000, max: 20 });
 
 const CONFIDENCE_THRESHOLD = 85; // Oracle locks when >= 85% confident
 const LOCK_TO_REVEAL_MS = 15 * 60 * 1000; // 15 minutes
@@ -532,7 +545,7 @@ function installProcessGuards() {
 // ─── ENDPOINTS ────────────────────────────────────────────────
 
 // Manual reveal trigger
-app.post("/reveal", async (req, res) => {
+app.post("/reveal", revealLimiter, requireAuth, async (req, res) => {
   const { watcher_id, whisper_id, whisper_title, urls, oracle_hint } = req.body;
   if (!watcher_id || !whisper_id) return res.status(400).json({ error: "Missing fields" });
   res.json({ status: "checking" });
@@ -550,7 +563,7 @@ app.post("/reveal", async (req, res) => {
 });
 
 // Date recommendation
-app.post("/recommend-date", async (req, res) => {
+app.post("/recommend-date", recommendLimiter, requireAuth, async (req, res) => {
   const { whisper_title, category, symbol_or_topic } = req.body;
   if (!whisper_title) return res.status(400).json({ error: "Missing whisper_title" });
 
@@ -591,7 +604,7 @@ app.post("/recommend-date", async (req, res) => {
 
 // ─── SCOUT ENDPOINT — Archon research tool ───────────────────
 // Searches real sources and returns 3 real whispers with real dates
-app.post("/scout", async (req, res) => {
+app.post("/scout", scoutLimiter, requireAuth, async (req, res) => {
   const { topic, category } = req.body;
   if (!topic || !category) return res.status(400).json({ error: "Missing topic or category" });
 
@@ -754,9 +767,18 @@ module.exports = {
   LOCK_TO_REVEAL_MS,
   POLL_INTERVAL_MS,
   PER_WHISPER_CHECK_INTERVAL,
+  // middleware (for tests)
+  scoutLimiter,
+  revealLimiter,
+  recommendLimiter,
   // test injection points
   __setHttpRequest(fn) { _httpRequest = fn; },
   __resetHttpRequest() { _httpRequest = httpRequest; },
   __setFetchURL(fn) { _fetchURL = fn; },
   __resetFetchURL() { _fetchURL = fetchURL; },
+  __resetLimiters() {
+    scoutLimiter._reset();
+    revealLimiter._reset();
+    recommendLimiter._reset();
+  },
 };
