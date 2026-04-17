@@ -412,21 +412,21 @@ setTimeout(async () => {
     console.log("[STARTUP] Running initial poll...");
     await pollWatchers();
   } catch (e) {
-    console.error("[STARTUP] Fatal error during initial poll:", e.message, e.stack);
-    process.exit(1);
+    console.error("[STARTUP] Error during initial poll (will retry):", e.message);
+    // Don't exit — let the service stay up and retry on next poll interval
   }
 }, 5000);
 
 // Catch unhandled promise rejections
 process.on("unhandledRejection", (reason, promise) => {
-  console.error("[FATAL] Unhandled rejection:", reason);
-  process.exit(1);
+  console.error("[ERROR] Unhandled rejection (will continue):", reason);
+  // Don't exit — let the service continue running
 });
 
 // Catch synchronous uncaught exceptions
 process.on("uncaughtException", (error) => {
-  console.error("[FATAL] Uncaught exception:", error.message, error.stack);
-  process.exit(1);
+  console.error("[ERROR] Uncaught exception (will continue):", error.message, error.stack);
+  // Don't exit — let the service continue running
 });
 
 // ─── ENDPOINTS ────────────────────────────────────────────────
