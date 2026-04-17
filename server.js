@@ -1,3 +1,5 @@
+console.log("[INIT] server.js starting...");
+
 // ============================================================
 // AMPHORACLE WATCHER SERVER v4.1
 // Evidence-based Oracle — no fixed reveal dates
