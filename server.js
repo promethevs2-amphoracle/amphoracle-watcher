@@ -9,6 +9,10 @@ const cheerio = require("cheerio");
 const https = require("https");
 const http = require("http");
 
+const { parseClaudeJSON } = require("./lib/parse-claude-json");
+const { decidePollInterval } = require("./lib/poll-interval");
+const { filterFutureWhispers } = require("./lib/filter-future-whispers");
+
 const app = express();
 app.use(express.json());
 
@@ -53,6 +57,11 @@ function httpRequest(options, body) {
   });
 }
 
+// Injection points so tests can replace the network boundary without
+// touching runtime behavior. Production keeps the originals.
+let _httpRequest = httpRequest;
+let _fetchURL;
+
 // ─── FETCH URL ───────────────────────────────────────────────
 function fetchURL(url) {
   return new Promise((resolve) => {
@@ -64,6 +73,7 @@ function fetchURL(url) {
       const req = lib.request({
         protocol: parsed.protocol,
         hostname: parsed.hostname,
+        port: parsed.port || undefined,
         path: parsed.pathname + parsed.search,
         method: "GET",
         headers: { "User-Agent": "Mozilla/5.0 (compatible; AmphoracleOracle/1.0)" },
@@ -89,6 +99,8 @@ function fetchURL(url) {
   });
 }
 
+_fetchURL = fetchURL;
+
 // ─── CALL CLAUDE ─────────────────────────────────────────────
 async function callClaude(systemPrompt, userMessage, maxTokens = 800) {
   const body = JSON.stringify({
@@ -98,7 +110,7 @@ async function callClaude(systemPrompt, userMessage, maxTokens = 800) {
     messages: [{ role: "user", content: userMessage }]
   });
 
-  const res = await httpRequest({
+  const res = await _httpRequest({
     protocol: "https:",
     hostname: "api.anthropic.com",
     path: "/v1/messages",
@@ -128,7 +140,7 @@ async function createNotification(userEmail, type, message, whisperId) {
     is_read: false
   });
   try {
-    await httpRequest({
+    await _httpRequest({
       protocol: "https:",
       hostname: "api.base44.com",
       path: "/api/apps/69d1545f93121e831922ce33/entities/Notification",
@@ -147,7 +159,7 @@ async function createNotification(userEmail, type, message, whisperId) {
 // Get all voters for a whisper
 async function getVotersForWhisper(whisperId) {
   try {
-    const res = await httpRequest({
+    const res = await _httpRequest({
       protocol: "https:",
       hostname: "api.base44.com",
       path: `/api/apps/69d1545f93121e831922ce33/entities/WhisperVote?whisper_id=${whisperId}&limit=500`,
@@ -175,7 +187,7 @@ async function notifyAllVoters(whisperId, whisperTitle, type, message) {
 
 async function patchBase44(entity, id, payload) {
   const body = JSON.stringify(payload);
-  return httpRequest({
+  return _httpRequest({
     protocol: "https:",
     hostname: "api.base44.com",
     path: `/api/apps/69d1545f93121e831922ce33/entities/${entity}/${id}`,
@@ -189,7 +201,7 @@ async function patchBase44(entity, id, payload) {
 }
 
 async function getWatchers() {
-  const res = await httpRequest({
+  const res = await _httpRequest({
     protocol: "https:",
     hostname: "api.base44.com",
     path: "/api/apps/69d1545f93121e831922ce33/entities/OracleWatcher?status=pending&limit=100",
@@ -203,7 +215,7 @@ async function getWatchers() {
 async function checkForDisruption(watcher) {
   const { whisper_title, urls, oracle_hint } = watcher;
 
-  const fetchResults = await Promise.all((urls || []).slice(0, 2).map(fetchURL));
+  const fetchResults = await Promise.all((urls || []).slice(0, 2).map(_fetchURL));
   const contentBlock = fetchResults
     .map(f => f.success ? `--- SOURCE: ${f.url} ---\n${f.content}` : `--- SOURCE: ${f.url} --- UNAVAILABLE ---`)
     .join("\n\n");
@@ -220,7 +232,7 @@ Respond in JSON only:
     300
   );
 
-  return JSON.parse(raw.replace(/```json|```/g, "").trim());
+  return parseClaudeJSON(raw);
 }
 
 // ─── ORACLE EVIDENCE CHECK ────────────────────────────────────
@@ -228,7 +240,7 @@ async function checkForEvidence(watcher) {
   const { id, whisper_id, whisper_title, urls, oracle_hint } = watcher;
 
   // Fetch all sources
-  const fetchResults = await Promise.all((urls || []).map(fetchURL));
+  const fetchResults = await Promise.all((urls || []).map(_fetchURL));
   const successCount = fetchResults.filter(f => f.success).length;
   console.log(`[ORACLE] Checked ${successCount}/${fetchResults.length} sources for: "${whisper_title}"`);
 
@@ -262,7 +274,7 @@ ${contentBlock}
 Has this prediction been conclusively answered? If confidence is below 85, set has_answer to false.`;
 
   const raw = await callClaude(systemPrompt, userMessage);
-  const parsed = JSON.parse(raw.replace(/```json|```/g, "").trim());
+  const parsed = parseClaudeJSON(raw);
   return parsed;
 }
 
@@ -358,19 +370,7 @@ async function pollWatchers() {
       const now = Date.now();
       const checkAfterDate = watcher.check_after_date ? new Date(watcher.check_after_date).getTime() : null;
       const last = lastChecked.get(watcher.whisper_id) || 0;
-
-      let checkInterval;
-      if (!checkAfterDate) {
-        checkInterval = PER_WHISPER_CHECK_INTERVAL; // No date: check every 5 min
-      } else if (now < checkAfterDate - 48 * 60 * 60 * 1000) {
-        checkInterval = 6 * 60 * 60 * 1000; // >48h away: check every 6 hours
-      } else if (now < checkAfterDate - 24 * 60 * 60 * 1000) {
-        checkInterval = 2 * 60 * 60 * 1000; // 24-48h away: check every 2 hours
-      } else if (now < checkAfterDate) {
-        checkInterval = 30 * 60 * 1000; // Same day but not yet: check every 30 min
-      } else {
-        checkInterval = PER_WHISPER_CHECK_INTERVAL; // Event time reached: check every 5 min (active mode)
-      }
+      const checkInterval = decidePollInterval(now, checkAfterDate);
 
       if (now - last < checkInterval) continue;
 
@@ -405,29 +405,33 @@ async function pollWatchers() {
   }
 }
 
-// Start polling
-setInterval(pollWatchers, POLL_INTERVAL_MS);
-setTimeout(async () => {
-  try {
-    console.log("[STARTUP] Running initial poll...");
-    await pollWatchers();
-  } catch (e) {
-    console.error("[STARTUP] Error during initial poll (will retry):", e.message);
-    // Don't exit — let the service stay up and retry on next poll interval
-  }
-}, 5000);
+function startBackgroundPolling() {
+  const pollTimer = setInterval(pollWatchers, POLL_INTERVAL_MS);
+  const initialTimer = setTimeout(async () => {
+    try {
+      console.log("[STARTUP] Running initial poll...");
+      await pollWatchers();
+    } catch (e) {
+      console.error("[STARTUP] Error during initial poll (will retry):", e.message);
+      // Don't exit — let the service stay up and retry on next poll interval
+    }
+  }, 5000);
+  return { pollTimer, initialTimer };
+}
 
-// Catch unhandled promise rejections
-process.on("unhandledRejection", (reason, promise) => {
-  console.error("[ERROR] Unhandled rejection (will continue):", reason);
-  // Don't exit — let the service continue running
-});
+function installProcessGuards() {
+  // Catch unhandled promise rejections
+  process.on("unhandledRejection", (reason, promise) => {
+    console.error("[ERROR] Unhandled rejection (will continue):", reason);
+    // Don't exit — let the service continue running
+  });
 
-// Catch synchronous uncaught exceptions
-process.on("uncaughtException", (error) => {
-  console.error("[ERROR] Uncaught exception (will continue):", error.message, error.stack);
-  // Don't exit — let the service continue running
-});
+  // Catch synchronous uncaught exceptions
+  process.on("uncaughtException", (error) => {
+    console.error("[ERROR] Uncaught exception (will continue):", error.message, error.stack);
+    // Don't exit — let the service continue running
+  });
+}
 
 // ─── ENDPOINTS ────────────────────────────────────────────────
 
@@ -466,7 +470,7 @@ app.post("/recommend-date", async (req, res) => {
   const urls = sourcesByCategory[category] || sourcesByCategory.politics;
 
   try {
-    const fetchResults = await Promise.all(urls.slice(0, 2).map(fetchURL));
+    const fetchResults = await Promise.all(urls.slice(0, 2).map(_fetchURL));
     const contentBlock = fetchResults
       .map(f => f.success ? `--- ${f.url} ---\n${f.content}` : `--- ${f.url} --- UNAVAILABLE ---`)
       .join("\n\n");
@@ -478,7 +482,7 @@ app.post("/recommend-date", async (req, res) => {
       300
     );
 
-    const result = JSON.parse(raw.replace(/```json|```/g, "").trim());
+    const result = parseClaudeJSON(raw);
     res.json({ success: true, ...result });
   } catch(e) {
     // Fallback
@@ -531,7 +535,7 @@ app.post("/scout", async (req, res) => {
 
   try {
     // Fetch top 3 sources in parallel
-    const fetchResults = await Promise.all(urls.slice(0, 3).map(fetchURL));
+    const fetchResults = await Promise.all(urls.slice(0, 3).map(_fetchURL));
     const successfulFetches = fetchResults.filter(f => f.success);
 
     if (successfulFetches.length === 0) {
@@ -579,7 +583,7 @@ Respond in JSON only, no markdown:
       1200
     );
 
-    const parsed = JSON.parse(raw.replace(/```json|```/g, "").trim());
+    const parsed = parseClaudeJSON(raw);
     const whispers = parsed.whispers || [];
 
     if (whispers.length === 0) {
@@ -591,11 +595,7 @@ Respond in JSON only, no markdown:
     }
 
     // Validate all dates are in the future
-    const today_ms = Date.now();
-    const validWhispers = whispers.filter(w => {
-      if (!w.check_after_date) return true;
-      return new Date(w.check_after_date).getTime() > today_ms;
-    });
+    const validWhispers = filterFutureWhispers(whispers, Date.now());
 
     console.log(`[SCOUT] Found ${validWhispers.length} real events for "${topic}"`);
     res.json({ success: true, whispers: validWhispers });
@@ -617,7 +617,46 @@ app.get("/", (req, res) => res.json({
 }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`\n🏺 Amphoracle Watcher v4.1 — Evidence-Based Oracle — Port ${PORT}`);
-  console.log(`[STARTUP] Server listening on port ${PORT}. Initial poll in 5 seconds...\n`);
-});
+
+// Only auto-start when run directly — not when required from tests.
+if (require.main === module) {
+  installProcessGuards();
+  startBackgroundPolling();
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`\n🏺 Amphoracle Watcher v4.1 — Evidence-Based Oracle — Port ${PORT}`);
+    console.log(`[STARTUP] Server listening on port ${PORT}. Initial poll in 5 seconds...\n`);
+  });
+}
+
+module.exports = {
+  app,
+  // functions
+  httpRequest,
+  fetchURL,
+  callClaude,
+  createNotification,
+  getVotersForWhisper,
+  notifyAllVoters,
+  patchBase44,
+  getWatchers,
+  checkForDisruption,
+  checkForEvidence,
+  lockWhisper,
+  executeReveal,
+  pollWatchers,
+  startBackgroundPolling,
+  // state
+  locked,
+  lastChecked,
+  revealTimers,
+  // constants
+  CONFIDENCE_THRESHOLD,
+  LOCK_TO_REVEAL_MS,
+  POLL_INTERVAL_MS,
+  PER_WHISPER_CHECK_INTERVAL,
+  // test injection points
+  __setHttpRequest(fn) { _httpRequest = fn; },
+  __resetHttpRequest() { _httpRequest = httpRequest; },
+  __setFetchURL(fn) { _fetchURL = fn; },
+  __resetFetchURL() { _fetchURL = fetchURL; },
+};
