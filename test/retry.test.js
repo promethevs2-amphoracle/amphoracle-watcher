@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { withRetry, isTransientError, isRetriableStatus } = require("../lib/retry");
+const { withRetry, isTransientError, isRetriableStatus, parseRetryAfter } = require("../lib/retry");
 
 // Synchronous "sleep" replacement so tests don't actually wait.
 const noSleep = () => Promise.resolve();
@@ -168,6 +168,90 @@ test("withRetry: invokes onRetry callback with attempt + delay + reason", async 
   assert.equal(events[0].attempt, 1);
   assert.equal(events[0].reason, "ECONNRESET");
   assert.equal(events[1].attempt, 2);
+});
+
+test("parseRetryAfter: integer seconds", () => {
+  assert.equal(parseRetryAfter("5"), 5000);
+  assert.equal(parseRetryAfter("0"), 0);
+  assert.equal(parseRetryAfter(120), 120_000);
+});
+
+test("parseRetryAfter: HTTP-date strings", () => {
+  // Use a date 10 seconds in the future
+  const future = new Date(Date.now() + 10_000).toUTCString();
+  const ms = parseRetryAfter(future);
+  // Allow some scheduling jitter
+  assert.ok(ms > 8_000 && ms < 12_000, `expected ~10000ms, got ${ms}`);
+});
+
+test("parseRetryAfter: returns null for garbage", () => {
+  assert.equal(parseRetryAfter(null), null);
+  assert.equal(parseRetryAfter(undefined), null);
+  assert.equal(parseRetryAfter("not a date"), null);
+});
+
+test("withRetry: honors Retry-After header on 429 (in seconds)", async () => {
+  let calls = 0;
+  const delays = [];
+  const fn = async () => {
+    calls++;
+    if (calls === 1) return { status: 429, headers: { "retry-after": "7" } };
+    return { status: 200 };
+  };
+  const wrapped = withRetry(fn, {
+    sleep: async (ms) => { delays.push(ms); },
+    backoff: () => 999_999, // would clearly mismatch — proves retry-after wins
+  });
+  await wrapped();
+  assert.deepEqual(delays, [7000]);
+  assert.equal(calls, 2);
+});
+
+test("withRetry: caps Retry-After at maxRetryAfterMs", async () => {
+  let calls = 0;
+  const delays = [];
+  const fn = async () => {
+    calls++;
+    if (calls === 1) return { status: 429, headers: { "retry-after": "9999" } }; // 9999 seconds
+    return { status: 200 };
+  };
+  const wrapped = withRetry(fn, {
+    sleep: async (ms) => { delays.push(ms); },
+    maxRetryAfterMs: 10_000,
+  });
+  await wrapped();
+  assert.deepEqual(delays, [10_000], "must cap to maxRetryAfterMs");
+});
+
+test("withRetry: falls back to backoff when no Retry-After header", async () => {
+  let calls = 0;
+  const delays = [];
+  const fn = async () => {
+    calls++;
+    if (calls === 1) return { status: 429, headers: {} };
+    return { status: 200 };
+  };
+  const wrapped = withRetry(fn, {
+    sleep: async (ms) => { delays.push(ms); },
+    backoff: () => 1234,
+  });
+  await wrapped();
+  assert.deepEqual(delays, [1234]);
+});
+
+test("withRetry: 5xx with Retry-After also honored", async () => {
+  let calls = 0;
+  const delays = [];
+  const fn = async () => {
+    calls++;
+    if (calls === 1) return { status: 503, headers: { "Retry-After": "3" } };
+    return { status: 200 };
+  };
+  const wrapped = withRetry(fn, {
+    sleep: async (ms) => { delays.push(ms); },
+  });
+  await wrapped();
+  assert.deepEqual(delays, [3000]);
 });
 
 test("withRetry: backoff function is called with attempt number", async () => {

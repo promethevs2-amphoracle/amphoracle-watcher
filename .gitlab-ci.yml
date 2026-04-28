@@ -1,0 +1,29 @@
+# GitLab CI: runs the test suite on every push.
+#
+# Free tier on GitLab.com gives 400 CI minutes/month, plenty for this repo.
+# A typical run is ~30s.
+
+stages:
+  - test
+
+test:
+  stage: test
+  image: node:18-alpine
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - node_modules/
+  script:
+    - npm ci --no-audit --no-fund
+    - npm test
+  rules:
+    # Run on every push to any branch and on every merge request pipeline.
+    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_REF_NAME == "main"
+
+  # If npm test exits non-zero the job fails and the pipeline goes red.
+  # Allow up to 5 min — a stuck test should fail loudly, not hang forever.
+  timeout: 5m
