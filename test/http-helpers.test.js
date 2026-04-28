@@ -3,6 +3,12 @@ const assert = require("node:assert/strict");
 const http = require("node:http");
 const server = require("../server");
 
+// These tests run a local HTTP server on 127.0.0.1 and aim fetchURL at it.
+// That IP is blocked by the SSRF guard in production, so relax the guard
+// for this file only. Each test still resets it via t.after() to avoid
+// leaking state into other test files.
+server.__setURLGuard(() => ({ ok: true }));
+
 function startServer(handler) {
   return new Promise((resolve) => {
     const s = http.createServer(handler);
