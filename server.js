@@ -14,6 +14,7 @@ const { decidePollInterval } = require("./lib/poll-interval");
 const { filterFutureWhispers } = require("./lib/filter-future-whispers");
 const { makeAuthMiddleware } = require("./lib/auth");
 const { makeRateLimit } = require("./lib/rate-limit");
+const { isSafeURL } = require("./lib/url-guard");
 
 const app = express();
 app.use(express.json());
@@ -75,11 +76,31 @@ function httpRequest(options, body) {
 let _httpRequest = httpRequest;
 let _fetchURL;
 
+// Default URL guard reads the allowlist from env on every call so
+// rotating FETCH_URL_ALLOWLIST takes effect without restart. Tests can
+// override via __setURLGuard to e.g. allow 127.0.0.1 for local servers.
+function defaultURLGuard(url) {
+  const allowlist = (process.env.FETCH_URL_ALLOWLIST || "")
+    .split(",").map((s) => s.trim()).filter(Boolean);
+  return isSafeURL(url, { allowlist });
+}
+let _urlGuard = defaultURLGuard;
+
 // ─── FETCH URL ───────────────────────────────────────────────
 function fetchURL(url) {
   return new Promise((resolve) => {
     try {
-      const fullUrl = url.startsWith("http") ? url : "https://" + url;
+      // Only prepend https:// when there is no scheme at all. Previously
+      // we prepended whenever the URL didn't start with "http", which
+      // would turn `file:///etc/passwd` into `https://file:///etc/passwd`
+      // and bypass the SSRF guard's unsupported-protocol check.
+      const fullUrl = /^[a-z][a-z0-9+.-]*:\/\//i.test(url) ? url : "https://" + url;
+      const guard = _urlGuard(fullUrl);
+      if (!guard.ok) {
+        console.log(`[FETCH] Blocked URL (${guard.reason}): ${url}`);
+        resolve({ url, content: null, success: false, error: `blocked:${guard.reason}` });
+        return;
+      }
       const parsed = new URL(fullUrl);
       const lib = parsed.protocol === "http:" ? http : https;
       let data = "";
@@ -776,6 +797,8 @@ module.exports = {
   __resetHttpRequest() { _httpRequest = httpRequest; },
   __setFetchURL(fn) { _fetchURL = fn; },
   __resetFetchURL() { _fetchURL = fetchURL; },
+  __setURLGuard(fn) { _urlGuard = fn; },
+  __resetURLGuard() { _urlGuard = defaultURLGuard; },
   __resetLimiters() {
     scoutLimiter._reset();
     revealLimiter._reset();
