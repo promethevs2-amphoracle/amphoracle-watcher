@@ -18,6 +18,9 @@ const { isSafeURL } = require("./lib/url-guard");
 const { withRetry } = require("./lib/retry");
 const { createLogger } = require("./lib/logger");
 const { createMetrics } = require("./lib/metrics");
+const { extractUsage, recordUsage, estimatedCostUsd } = require("./lib/anthropic-usage");
+const { createCircuitBreaker, CircuitOpenError } = require("./lib/circuit-breaker");
+const { createCacheContext, withCache } = require("./lib/url-cache");
 
 const log = createLogger();
 const metrics = createMetrics();
@@ -66,8 +69,11 @@ function httpRequest(options, body) {
       let data = "";
       res.on("data", (chunk) => data += chunk);
       res.on("end", () => {
-        try { resolve({ status: res.statusCode, data: JSON.parse(data) }); }
-        catch { resolve({ status: res.statusCode, data }); }
+        // Headers are exposed so callers (e.g. the retry helper) can
+        // honor Retry-After on 429 responses without reparsing.
+        const headers = res.headers || {};
+        try { resolve({ status: res.statusCode, headers, data: JSON.parse(data) }); }
+        catch { resolve({ status: res.statusCode, headers, data }); }
       });
     });
     req.on("error", reject);
@@ -85,6 +91,21 @@ const httpRequestWithRetry = withRetry(httpRequest, {
   onRetry: ({ attempt, delay, reason }) => {
     metrics.inc("http_retries", 1, { reason });
     log.warn("http_retry", { attempt, delay_ms: delay, reason });
+  },
+});
+
+// Circuit breaker for Base44 specifically. If Base44 starts failing, we
+// stop hammering it (which also stops burning Anthropic tokens upstream
+// of Base44 writes that would just fail anyway). Only Base44 is wrapped
+// — Anthropic stays on plain retry since we always want to give the
+// model a chance to respond.
+const base44Breaker = createCircuitBreaker({
+  name: "base44",
+  failureThreshold: 5,
+  cooldownMs: 60_000,
+  onStateChange: ({ from, to, reason }) => {
+    metrics.inc("circuit_state_changes", 1, { circuit: "base44", to });
+    log.warn("circuit_state_change", { circuit: "base44", from, to, reason });
   },
 });
 
@@ -153,9 +174,11 @@ function fetchURL(url) {
 _fetchURL = fetchURL;
 
 // ─── CALL CLAUDE ─────────────────────────────────────────────
+const CLAUDE_MODEL = "claude-opus-4-6";
+
 async function callClaude(systemPrompt, userMessage, maxTokens = 800) {
   const body = JSON.stringify({
-    model: "claude-opus-4-6",
+    model: CLAUDE_MODEL,
     max_tokens: maxTokens,
     system: systemPrompt,
     messages: [{ role: "user", content: userMessage }]
@@ -174,12 +197,28 @@ async function callClaude(systemPrompt, userMessage, maxTokens = 800) {
     }
   }, body);
 
+  // Record token usage and estimated cost before throwing on missing
+  // text — partial responses still cost money.
+  const usage = extractUsage(res.data);
+  recordUsage(metrics, { model: CLAUDE_MODEL, usage });
+  log.info("claude_call", {
+    model: CLAUDE_MODEL,
+    input_tokens: usage.input_tokens,
+    output_tokens: usage.output_tokens,
+    estimated_cost_usd: estimatedCostUsd({ model: CLAUDE_MODEL, ...usage }),
+  });
+
   const textBlock = res.data.content && res.data.content.find(b => b.type === "text");
   if (!textBlock) throw new Error("No text from Claude: " + JSON.stringify(res.data).slice(0, 200));
   return textBlock.text;
 }
 
 // ─── BASE44 HELPERS ──────────────────────────────────────────
+
+// All Base44-bound HTTP requests go through this. The circuit breaker
+// fails fast (no network attempt) when Base44 has tripped — protecting
+// the rest of the system from piling work on a degraded backend.
+const base44Request = base44Breaker.wrap((options, body) => _httpRequest(options, body));
 
 // Post a single notification record
 async function createNotification(userEmail, type, message, whisperId) {
@@ -191,7 +230,7 @@ async function createNotification(userEmail, type, message, whisperId) {
     is_read: false
   });
   try {
-    await _httpRequest({
+    await base44Request({
       protocol: "https:",
       hostname: "api.base44.com",
       path: "/api/apps/69d1545f93121e831922ce33/entities/Notification",
@@ -210,7 +249,7 @@ async function createNotification(userEmail, type, message, whisperId) {
 // Get all voters for a whisper
 async function getVotersForWhisper(whisperId) {
   try {
-    const res = await _httpRequest({
+    const res = await base44Request({
       protocol: "https:",
       hostname: "api.base44.com",
       path: `/api/apps/69d1545f93121e831922ce33/entities/WhisperVote?whisper_id=${whisperId}&limit=500`,
@@ -238,7 +277,7 @@ async function notifyAllVoters(whisperId, whisperTitle, type, message) {
 
 async function patchBase44(entity, id, payload) {
   const body = JSON.stringify(payload);
-  return _httpRequest({
+  return base44Request({
     protocol: "https:",
     hostname: "api.base44.com",
     path: `/api/apps/69d1545f93121e831922ce33/entities/${entity}/${id}`,
@@ -252,7 +291,7 @@ async function patchBase44(entity, id, payload) {
 }
 
 async function getWatchers() {
-  const res = await _httpRequest({
+  const res = await base44Request({
     protocol: "https:",
     hostname: "api.base44.com",
     path: "/api/apps/69d1545f93121e831922ce33/entities/OracleWatcher?status=pending&limit=100",
@@ -264,7 +303,7 @@ async function getWatchers() {
 
 // List Whispers currently in the lock window (between lock and reveal).
 async function listLockedWhispers() {
-  const res = await _httpRequest({
+  const res = await base44Request({
     protocol: "https:",
     hostname: "api.base44.com",
     path: "/api/apps/69d1545f93121e831922ce33/entities/Whisper?status=locked&limit=100",
@@ -276,7 +315,7 @@ async function listLockedWhispers() {
 
 // Find the OracleWatcher for a given whisper_id. Returns null if none.
 async function getWatcherByWhisperId(whisperId) {
-  const res = await _httpRequest({
+  const res = await base44Request({
     protocol: "https:",
     hostname: "api.base44.com",
     path: `/api/apps/69d1545f93121e831922ce33/entities/OracleWatcher?whisper_id=${encodeURIComponent(whisperId)}&limit=1`,
@@ -288,10 +327,10 @@ async function getWatcherByWhisperId(whisperId) {
 }
 
 // ─── DISRUPTION CHECK ────────────────────────────────────────
-async function checkForDisruption(watcher) {
+async function checkForDisruption(watcher, { fetchFn = _fetchURL } = {}) {
   const { whisper_title, urls, oracle_hint } = watcher;
 
-  const fetchResults = await Promise.all((urls || []).slice(0, 2).map(_fetchURL));
+  const fetchResults = await Promise.all((urls || []).slice(0, 2).map(fetchFn));
   const contentBlock = fetchResults
     .map(f => f.success ? `--- SOURCE: ${f.url} ---\n${f.content}` : `--- SOURCE: ${f.url} --- UNAVAILABLE ---`)
     .join("\n\n");
@@ -312,11 +351,11 @@ Respond in JSON only:
 }
 
 // ─── ORACLE EVIDENCE CHECK ────────────────────────────────────
-async function checkForEvidence(watcher) {
+async function checkForEvidence(watcher, { fetchFn = _fetchURL } = {}) {
   const { id, whisper_id, whisper_title, urls, oracle_hint } = watcher;
 
   // Fetch all sources
-  const fetchResults = await Promise.all((urls || []).map(_fetchURL));
+  const fetchResults = await Promise.all((urls || []).map(fetchFn));
   const successCount = fetchResults.filter(f => f.success).length;
   console.log(`[ORACLE] Checked ${successCount}/${fetchResults.length} sources for: "${whisper_title}"`);
 
@@ -564,11 +603,17 @@ async function pollWatchers() {
       lastChecked.set(watcher.whisper_id, Date.now());
 
       try {
-        // Run both checks in parallel
+        // Share a per-watcher fetch cache so we don't double-fetch the
+        // same source URL across both Claude calls. checkForDisruption
+        // hits the first 2 URLs; checkForEvidence hits all of them —
+        // overlap is the common case.
+        const cache = createCacheContext();
+        const cachedFetch = withCache(_fetchURL, cache);
         const [disruption, evidence] = await Promise.all([
-          checkForDisruption(watcher),
-          checkForEvidence(watcher)
+          checkForDisruption(watcher, { fetchFn: cachedFetch }),
+          checkForEvidence(watcher, { fetchFn: cachedFetch })
         ]);
+        metrics.inc("fetch_cache_size", cache.size);
 
         if (disruption.disrupted) {
           // Mark unverifiable with reason
@@ -839,7 +884,7 @@ Respond in JSON only, no markdown:
   }
 });
 
-// Health check
+// Health check (legacy, also serves as the public-facing pulse)
 app.get("/", (req, res) => res.json({
   status: "online",
   service: "Amphoracle Watcher v4.1",
@@ -848,6 +893,34 @@ app.get("/", (req, res) => res.json({
   locked_pending_reveal: locked.size,
   uptime: Math.floor(process.uptime())
 }));
+
+// Liveness probe — "is the process alive". Always 200 unless the
+// event loop is genuinely wedged. Railway uses this kind of probe to
+// decide whether to kill and restart the container.
+app.get("/healthz", (req, res) => {
+  res.json({ status: "ok", uptime_seconds: Math.floor(process.uptime()) });
+});
+
+// Readiness probe — "is the app ready to serve real traffic". Returns
+// 503 if required env vars are missing or boot recovery hasn't completed.
+// Load balancers route traffic away from a service until /readyz is 200.
+//
+// Reasons we may not be ready:
+//   - boot recovery still running (revealTimers map not yet hydrated)
+//   - critical env vars unset (would cause every Base44/Claude call to fail)
+const readinessState = { recoveryComplete: false };
+app.get("/readyz", (req, res) => {
+  const reasons = [];
+  if (!readinessState.recoveryComplete) reasons.push("boot_recovery_pending");
+  if (!process.env.BASE44_API_KEY) reasons.push("BASE44_API_KEY_missing");
+  if (!process.env.amphoracle_railway) reasons.push("ANTHROPIC_KEY_missing");
+
+  if (reasons.length === 0) {
+    res.json({ status: "ready", uptime_seconds: Math.floor(process.uptime()) });
+  } else {
+    res.status(503).json({ status: "not_ready", reasons });
+  }
+});
 
 // Metrics — JSON snapshot of counters/gauges. Read-only.
 // Stays unauthenticated by design so external monitors can scrape it.
@@ -864,7 +937,9 @@ const PORT = process.env.PORT || 3000;
 // Only auto-start when run directly — not when required from tests.
 if (require.main === module) {
   installProcessGuards();
-  recoverRevealTimers().catch((e) => console.error("[RECOVERY] Boot error:", e.message));
+  recoverRevealTimers()
+    .catch((e) => console.error("[RECOVERY] Boot error:", e.message))
+    .finally(() => { readinessState.recoveryComplete = true; });
   const { pollTimer, initialTimer } = startBackgroundPolling();
   const httpServer = app.listen(PORT, "0.0.0.0", () => {
     console.log(`\n🏺 Amphoracle Watcher v4.1 — Evidence-Based Oracle — Port ${PORT}`);
@@ -904,6 +979,9 @@ module.exports = {
   // observability
   log,
   metrics,
+  readinessState,
+  base44Breaker,
+  CircuitOpenError,
   startBackgroundPolling,
   // state
   locked,
