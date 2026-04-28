@@ -15,6 +15,12 @@ const { filterFutureWhispers } = require("./lib/filter-future-whispers");
 const { makeAuthMiddleware } = require("./lib/auth");
 const { makeRateLimit } = require("./lib/rate-limit");
 const { isSafeURL } = require("./lib/url-guard");
+const { withRetry } = require("./lib/retry");
+const { createLogger } = require("./lib/logger");
+const { createMetrics } = require("./lib/metrics");
+
+const log = createLogger();
+const metrics = createMetrics();
 
 const app = express();
 app.use(express.json());
@@ -71,9 +77,20 @@ function httpRequest(options, body) {
   });
 }
 
+// Wrap httpRequest with retry-on-transient-failure. Anthropic and Base44
+// both occasionally return 5xx or have brief network blips; without retries
+// a single hiccup can mark a whisper "skipped" for up to 6 hours.
+const httpRequestWithRetry = withRetry(httpRequest, {
+  maxAttempts: 3,
+  onRetry: ({ attempt, delay, reason }) => {
+    metrics.inc("http_retries", 1, { reason });
+    log.warn("http_retry", { attempt, delay_ms: delay, reason });
+  },
+});
+
 // Injection points so tests can replace the network boundary without
 // touching runtime behavior. Production keeps the originals.
-let _httpRequest = httpRequest;
+let _httpRequest = httpRequestWithRetry;
 let _fetchURL;
 
 // Default URL guard reads the allowlist from env on every call so
@@ -343,6 +360,8 @@ async function lockWhisper(watcher, verdict, confidence, reasoning, evidence) {
   const lockTime = new Date().toISOString();
 
   console.log(`\n🔒 LOCKING: "${whisper_title}" — ${verdict.toUpperCase()} (${confidence}%)`);
+  metrics.inc("whispers_locked", 1, { verdict });
+  log.info("whisper_locked", { whisper_id, whisper_title, verdict, confidence });
 
   locked.set(whisper_id, Date.now());
 
@@ -384,6 +403,8 @@ async function executeReveal(watcher, verdict, confidence, reasoning) {
   const ts = new Date().toISOString();
 
   console.log(`\n🏺 REVEALING: "${whisper_title}" — ${verdict.toUpperCase()}`);
+  metrics.inc("whispers_revealed", 1, { verdict });
+  log.info("whisper_revealed", { whisper_id, whisper_title, verdict });
 
   await Promise.all([
     patchBase44("OracleWatcher", id, {
@@ -410,7 +431,28 @@ async function executeReveal(watcher, verdict, confidence, reasoning) {
 
   locked.delete(whisper_id);
   revealTimers.delete(whisper_id);
+  lastChecked.delete(whisper_id);
   console.log(`[ORACLE] ✓ Revealed: "${whisper_title}" 🏺\n`);
+}
+
+// Drop in-memory state for whispers that are no longer in the active
+// watcher set. Without this the maps grow unbounded as old whispers
+// are revealed/disrupted/expired upstream.
+function pruneState(activeWhisperIds) {
+  const active = new Set(activeWhisperIds);
+  let pruned = 0;
+  for (const id of lastChecked.keys()) {
+    if (!active.has(id)) { lastChecked.delete(id); pruned++; }
+  }
+  for (const id of locked.keys()) {
+    if (!active.has(id) && !revealTimers.has(id)) {
+      // Don't drop a locked whisper that still has a pending reveal timer —
+      // recovery's invariant is that locked entry survives until executeReveal.
+      locked.delete(id);
+      pruned++;
+    }
+  }
+  return pruned;
 }
 
 // ─── BOOT-TIME REVEAL RECOVERY ───────────────────────────────
@@ -486,8 +528,23 @@ async function recoverRevealTimers() {
 
 // ─── MAIN POLL LOOP ───────────────────────────────────────────
 async function pollWatchers() {
+  metrics.inc("polls");
   try {
     const watchers = await getWatchers();
+
+    // Prune state for whispers that have aged out of the active watcher
+    // set (revealed, disrupted, deleted upstream). Done every cycle so
+    // memory stays bounded even with churn.
+    const pruned = pruneState(watchers.map((w) => w.whisper_id));
+    if (pruned > 0) {
+      console.log(`[POLL] Pruned ${pruned} stale state entries`);
+      metrics.inc("state_pruned", pruned);
+    }
+
+    metrics.gauge("active_watchers", watchers.length);
+    metrics.gauge("locked_pending_reveal", locked.size);
+    metrics.gauge("last_checked_size", lastChecked.size);
+
     if (watchers.length === 0) return;
 
     console.log(`[POLL] Checking ${watchers.length} active watcher(s)...`);
@@ -516,11 +573,14 @@ async function pollWatchers() {
         if (disruption.disrupted) {
           // Mark unverifiable with reason
           console.log(`\n⚠️ DISRUPTED: "${watcher.whisper_title}" — ${disruption.reason}`);
+          metrics.inc("whispers_disrupted");
+          log.warn("whisper_disrupted", { whisper_id: watcher.whisper_id, reason: disruption.reason });
           await Promise.all([
             patchBase44("OracleWatcher", watcher.id, { status: "revealed", oracle_verdict: "unverifiable", oracle_reasoning: disruption.reason, revealed_at: new Date().toISOString() }),
             patchBase44("Whisper", watcher.whisper_id, { status: "unverifiable", unverifiable_reason: disruption.reason, revealed_at: new Date().toISOString() })
           ]);
           locked.delete(watcher.whisper_id);
+          lastChecked.delete(watcher.whisper_id);
         } else if (evidence.has_answer && evidence.confidence >= CONFIDENCE_THRESHOLD) {
           await lockWhisper(watcher, evidence.verdict, evidence.confidence, evidence.reasoning, evidence.evidence);
         } else {
@@ -528,10 +588,14 @@ async function pollWatchers() {
         }
       } catch(e) {
         console.error(`[POLL] Error checking "${watcher.whisper_title}":`, e.message);
+        metrics.inc("poll_errors", 1, { phase: "per_watcher" });
+        log.error("poll_watcher_error", { whisper_id: watcher.whisper_id, message: e.message });
       }
     }
   } catch(e) {
     console.error("[POLL] Error:", e.message);
+    metrics.inc("poll_errors", 1, { phase: "outer" });
+    log.error("poll_error", { message: e.message });
   }
 }
 
@@ -547,6 +611,45 @@ function startBackgroundPolling() {
     }
   }, 5000);
   return { pollTimer, initialTimer };
+}
+
+// Graceful shutdown: stop accepting new HTTP, stop the poll loop, wait
+// for in-flight reveals to settle, then exit. Without this, Railway's
+// 30s SIGKILL kills work mid-flight (PATCHes can land partially, voters
+// can be notified twice on the next deploy after recovery re-runs).
+//
+// Returns a promise that resolves once everything is wound down or after
+// the timeout, whichever comes first.
+function gracefulShutdown({ httpServer, pollTimer, initialTimer, timeoutMs = 25_000 } = {}) {
+  console.log("[SHUTDOWN] Received signal, draining...");
+
+  if (pollTimer) clearInterval(pollTimer);
+  if (initialTimer) clearTimeout(initialTimer);
+
+  // Don't fire any more reveal timers — they'll be re-recovered on next boot
+  // from the persisted reveal_scheduled_for field.
+  for (const t of revealTimers.values()) clearTimeout(t);
+  revealTimers.clear();
+
+  return new Promise((resolve) => {
+    const finish = (reason) => {
+      console.log(`[SHUTDOWN] ${reason}`);
+      resolve();
+    };
+
+    const hardCutoff = setTimeout(() => finish("Forced exit after timeout"), timeoutMs);
+
+    if (!httpServer) {
+      clearTimeout(hardCutoff);
+      return finish("No HTTP server to close");
+    }
+
+    httpServer.close((err) => {
+      clearTimeout(hardCutoff);
+      if (err) finish(`Closed with error: ${err.message}`);
+      else finish("HTTP server closed cleanly");
+    });
+  });
 }
 
 function installProcessGuards() {
@@ -746,17 +849,35 @@ app.get("/", (req, res) => res.json({
   uptime: Math.floor(process.uptime())
 }));
 
+// Metrics — JSON snapshot of counters/gauges. Read-only.
+// Stays unauthenticated by design so external monitors can scrape it.
+// Don't put anything sensitive in metric names/values.
+app.get("/metrics", (req, res) => {
+  metrics.gauge("locked_pending_reveal", locked.size);
+  metrics.gauge("last_checked_size", lastChecked.size);
+  metrics.gauge("reveal_timers_pending", revealTimers.size);
+  res.json(metrics.snapshot());
+});
+
 const PORT = process.env.PORT || 3000;
 
 // Only auto-start when run directly — not when required from tests.
 if (require.main === module) {
   installProcessGuards();
   recoverRevealTimers().catch((e) => console.error("[RECOVERY] Boot error:", e.message));
-  startBackgroundPolling();
-  app.listen(PORT, "0.0.0.0", () => {
+  const { pollTimer, initialTimer } = startBackgroundPolling();
+  const httpServer = app.listen(PORT, "0.0.0.0", () => {
     console.log(`\n🏺 Amphoracle Watcher v4.1 — Evidence-Based Oracle — Port ${PORT}`);
     console.log(`[STARTUP] Server listening on port ${PORT}. Initial poll in 5 seconds...\n`);
   });
+
+  // Trap Railway's deploy / scale-down / Ctrl-C signals.
+  for (const signal of ["SIGTERM", "SIGINT"]) {
+    process.on(signal, async () => {
+      await gracefulShutdown({ httpServer, pollTimer, initialTimer });
+      process.exit(0);
+    });
+  }
 }
 
 module.exports = {
@@ -778,6 +899,11 @@ module.exports = {
   lockWhisper,
   executeReveal,
   pollWatchers,
+  pruneState,
+  gracefulShutdown,
+  // observability
+  log,
+  metrics,
   startBackgroundPolling,
   // state
   locked,
@@ -794,7 +920,7 @@ module.exports = {
   recommendLimiter,
   // test injection points
   __setHttpRequest(fn) { _httpRequest = fn; },
-  __resetHttpRequest() { _httpRequest = httpRequest; },
+  __resetHttpRequest() { _httpRequest = httpRequestWithRetry; },
   __setFetchURL(fn) { _fetchURL = fn; },
   __resetFetchURL() { _fetchURL = fetchURL; },
   __setURLGuard(fn) { _urlGuard = fn; },
