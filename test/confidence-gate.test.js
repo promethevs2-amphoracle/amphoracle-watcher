@@ -111,3 +111,85 @@ test("checkForDisruption returns the parsed disruption verdict", async (t) => {
   assert.equal(out.disrupted, true);
   assert.equal(out.reason, "Match cancelled.");
 });
+
+// Phase-1 must catch FALSE PREMISES (event doesn't exist), not just disruptions
+// of real events. The prompt is the contract here — if "FALSE PREMISE" drops
+// out of the system prompt, Claude reverts to assuming the event is real.
+test("checkForDisruption prompt instructs Claude to flag false premises (event-not-found), not just disruptions", async (t) => {
+  const http = setup(JSON.stringify({ disrupted: false, reason: null }));
+  t.after(reset);
+
+  await server.checkForDisruption({
+    whisper_title: "Will the Mars Olympics 2026 finals end before 9 PM?",
+    urls: ["https://example.com"],
+    oracle_hint: "",
+  });
+
+  const body = http.calls[0].body;
+  assert.match(body, /FALSE PREMISE/, "system prompt must instruct Claude to detect false-premise events");
+  assert.match(body, /Absence of the event across all sources counts as a false premise/,
+    "system prompt must tell Claude that absence-of-evidence counts as false premise (not 'unknown')");
+});
+
+// When oracle_hint is present, Phase-1 should treat it as the expected
+// verification source, so a hint-matching source showing nothing strongly
+// suggests false premise.
+test("checkForDisruption prompt elevates oracle_hint to EXPECTED VERIFICATION SOURCE when present", async (t) => {
+  const http = setup(JSON.stringify({ disrupted: false, reason: null }));
+  t.after(reset);
+
+  await server.checkForDisruption({
+    whisper_title: "Will Real Madrid beat Barcelona?",
+    urls: ["https://example.com"],
+    oracle_hint: "official LaLiga match statistics",
+  });
+
+  const body = http.calls[0].body;
+  assert.match(body, /EXPECTED VERIFICATION SOURCE/, "system prompt must mark hint as expected verification source");
+  assert.match(body, /official LaLiga match statistics/, "user message must still carry the hint text through to Claude");
+});
+
+// When oracle_hint is present, Phase-2 (checkForEvidence) should prioritize
+// it as the authoritative source. New custom-whisper flow ships hints like
+// "official LaLiga match statistics" — Claude must weight that over noise.
+test("checkForEvidence prompt elevates oracle_hint to PRIORITY / EXPECTED SOURCE when present", async (t) => {
+  const http = setup(JSON.stringify({ has_answer: false, verdict: "unverifiable", confidence: 10 }));
+  t.after(reset);
+
+  await server.checkForEvidence({
+    id: "w1",
+    whisper_id: "w1",
+    whisper_title: "Did Real Madrid win?",
+    urls: ["https://example.com"],
+    oracle_hint: "official LaLiga match statistics",
+  });
+
+  const body = http.calls[0].body;
+  assert.match(body, /PRIORITY \/ EXPECTED SOURCE/, "system prompt must mark hint as priority/expected source");
+  assert.match(body, /priority source to check first/, "system prompt must tell Claude to check the hint source first");
+  assert.match(body, /base the verdict on evidence strength/,
+    "system prompt must base the verdict on evidence strength, not blind hint-trust");
+  assert.match(body, /multiple independent authoritative sources contradict the hint source, do not lock a verdict; require corroboration/,
+    "system prompt must require corroboration and refuse to lock when authoritative sources contradict the hint");
+  assert.match(body, /official LaLiga match statistics/, "user message must still carry the hint text through to Claude");
+});
+
+// Backward-compat: when no hint is given, the evidence prompt still works
+// and falls back to the existing "Determine if this prediction came true"
+// instruction in the user message.
+test("checkForEvidence still uses default fallback wording when oracle_hint is empty", async (t) => {
+  const http = setup(JSON.stringify({ has_answer: false, verdict: "unverifiable", confidence: 10 }));
+  t.after(reset);
+
+  await server.checkForEvidence({
+    id: "w1",
+    whisper_id: "w1",
+    whisper_title: "Did X happen?",
+    urls: ["https://example.com"],
+    // no oracle_hint
+  });
+
+  const body = http.calls[0].body;
+  assert.match(body, /Determine if this prediction came true based on the sources/,
+    "empty hint must fall back to the default 'determine if this prediction came true' wording");
+});
