@@ -336,12 +336,17 @@ async function checkForDisruption(watcher, { fetchFn = _fetchURL } = {}) {
     .join("\n\n");
 
   const raw = await callClaude(
-    `You are the Oracle of Amphoracle. Check if anything has disrupted or cancelled the event this prediction is based on — making it impossible to verify. Look for: cancellations, postponements, withdrawals, trading halts, deaths, legal blocks, weather cancellations, or any event that prevents the prediction from being answerable.
+    `You are the Oracle of Amphoracle. Check whether this prediction can still be verified. Two failure modes void a whisper:
+
+1. DISRUPTION: the event existed but was cancelled, postponed, withdrawn, halted, blocked, or otherwise prevented (weather, death, legal block, trading halt, etc.).
+2. FALSE PREMISE: no such event can be found in any reputable source — the prediction is based on an event that does not exist or is not scheduled. Absence of the event across all sources counts as a false premise (not "unknown").
+
+If a HINT is provided, treat it as the EXPECTED VERIFICATION SOURCE — the authoritative place this event should appear. If sources matching the hint show no trace of the event, that strongly indicates a false premise.
 
 Respond in JSON only:
 {
   "disrupted": true or false,
-  "reason": "If disrupted: one sentence in Oracle voice explaining what happened. If not disrupted: null"
+  "reason": "If disrupted: one sentence in Oracle voice explaining what happened (disruption) OR that no such event can be found (false premise). If not disrupted: null"
 }`,
     `WHISPER: "${whisper_title}"\nHINT: ${oracle_hint || ""}\n\nSOURCES:\n${contentBlock}`,
     300
@@ -369,6 +374,7 @@ RULES:
 - Only deliver a verdict if you find CONCLUSIVE evidence in the sources
 - If evidence is inconclusive or the event hasn't happened yet, say so clearly
 - Confidence must be >= 85 to lock a verdict
+- If a VERIFICATION HINT is provided, treat it as the PRIORITY / EXPECTED SOURCE. Treat the hint as the priority source to check first, but base the verdict on evidence strength — if multiple independent authoritative sources contradict the hint source, do not lock a verdict; require corroboration.
 - Be extremely precise — this prediction will be revealed to thousands of seers
 
 Respond in JSON only, no markdown:
