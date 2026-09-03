@@ -113,3 +113,61 @@ test("/scout drops whispers with invalid date strings", async (t) => {
   assert.equal(res.data.whispers.length, 1);
   assert.equal(res.data.whispers[0].title, "good");
 });
+
+test("/scout succeeds with valid whispers end-to-end", async (t) => {
+  t.after(reset);
+  server.__setFetchURL(alwaysFetchURL());
+
+  const futureDate1 = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+  const futureDate2 = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString();
+  const pastDate = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+
+  const whispers = [
+    {
+      title: "Will Bitcoin reach $50k?",
+      category: "stocks_crypto",
+      symbol_or_topic: "BTC",
+      verification_hint: "Check CoinMarketCap BTC price",
+      sources: ["https://coinmarketcap.com"],
+      check_after_date: futureDate1,
+      duration_type: "daily",
+      event_found: "Bitcoin at current price",
+    },
+    {
+      title: "Will Ethereum hit $3k?",
+      category: "stocks_crypto",
+      symbol_or_topic: "ETH",
+      verification_hint: "Check Ethereum price",
+      sources: ["https://coinmarketcap.com"],
+      check_after_date: futureDate2,
+      duration_type: "daily",
+      event_found: "Ethereum at current price",
+    },
+    {
+      title: "Past event",
+      category: "stocks_crypto",
+      check_after_date: pastDate,
+      // This should be filtered out
+    },
+  ];
+
+  server.__setHttpRequest(
+    queuedHttpRequest([claudeResponse(JSON.stringify({ whispers }))]),
+  );
+
+  const res = await requestJSON(server.app, "POST", "/scout", {
+    topic: "bitcoin ethereum",
+    category: "stocks_crypto",
+  });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.data.success, true);
+  assert.equal(res.data.whispers.length, 2, "should include 2 future-dated whispers, filter out past");
+  assert.ok(res.data.whispers.some((w) => w.title === "Will Bitcoin reach $50k?"));
+  assert.ok(res.data.whispers.some((w) => w.title === "Will Ethereum hit $3k?"));
+  assert.equal(
+    res.data.whispers.some((w) => w.title === "Past event"),
+    false,
+    "past-dated whispers should be filtered out"
+  );
+});
