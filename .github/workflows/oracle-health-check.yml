@@ -1,0 +1,54 @@
+name: Oracle Watcher Health Check
+
+on:
+  schedule:
+    # Run every 5 minutes
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    name: Health Check
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Oracle Watcher Health Check
+        env:
+          BASE44_API_KEY: ${{ secrets.BASE44_API_KEY }}
+          LOG_LEVEL: info
+        run: |
+          chmod +x ./scripts/health-check.sh
+          ./scripts/health-check.sh
+
+      - name: Log Check Results
+        if: always()
+        run: |
+          echo "Health check completed at $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+
+  notify-on-failure:
+    runs-on: ubuntu-latest
+    name: Notify on Failure
+    needs: health-check
+    if: failure()
+
+    steps:
+      - name: Create Issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'Oracle Watcher Health Check Failed',
+              body: `The scheduled health check workflow failed at ${new Date().toISOString()}.\n\nSee: ${context.server_url}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              labels: ['bug', 'monitoring']
+            })
