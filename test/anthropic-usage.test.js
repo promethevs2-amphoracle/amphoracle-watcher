@@ -10,8 +10,9 @@ const {
 const { createMetrics } = require("../lib/metrics");
 
 test("priceFor: returns the entry for a known model", () => {
-  assert.deepEqual(priceFor("claude-opus-4-6"), { input: 15, output: 75 });
+  assert.deepEqual(priceFor("claude-opus-4-6"), { input: 5, output: 25 });
   assert.deepEqual(priceFor("claude-sonnet-4-6"), { input: 3, output: 15 });
+  assert.deepEqual(priceFor("claude-sonnet-5-5"), { input: 2, output: 10 });
 });
 
 test("priceFor: falls back to opus pricing for unknown models", () => {
@@ -25,9 +26,9 @@ test("estimatedCostUsd: zero tokens => zero cost", () => {
 });
 
 test("estimatedCostUsd: opus 1k in / 1k out", () => {
-  // 1000 in @ $15/M = $0.015; 1000 out @ $75/M = $0.075; total $0.09
+  // 1000 in @ $5/M = $0.005; 1000 out @ $25/M = $0.025; total $0.03
   const cost = estimatedCostUsd({ model: "claude-opus-4-6", input_tokens: 1000, output_tokens: 1000 });
-  assert.equal(cost, 0.09);
+  assert.equal(cost, 0.03);
 });
 
 test("estimatedCostUsd: sonnet 10k in / 2k out", () => {
@@ -79,8 +80,8 @@ test("recordUsage: claude_cost_usd_micros accumulates", () => {
   const m = createMetrics();
   recordUsage(m, { model: "claude-opus-4-6", usage: { input_tokens: 1000, output_tokens: 1000 } });
   recordUsage(m, { model: "claude-opus-4-6", usage: { input_tokens: 1000, output_tokens: 1000 } });
-  // 0.09 USD per call * 2 = 0.18 USD = 180_000 micros
-  assert.equal(m.snapshot().counters.claude_cost_usd_micros, 180_000);
+  // 0.03 USD per call * 2 = 0.06 USD = 60_000 micros
+  assert.equal(m.snapshot().counters.claude_cost_usd_micros, 60_000);
 });
 
 test("recordUsage: cache token counters only emit when > 0", () => {

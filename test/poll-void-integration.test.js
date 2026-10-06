@@ -13,16 +13,15 @@ const server = require("../server");
 const { stubFetchURL } = require("./helpers/mocks");
 
 // Routed httpRequest mock: returns the right response based on the
-// outbound call's hostname/method. Distinguishes Claude's two parallel
-// calls (disruption vs evidence) by looking for the "FALSE PREMISE"
-// marker in the system prompt body.
+// outbound call's hostname/method. The Oracle makes ONE call per check,
+// so the mock merges the disruption and evidence fixtures into one JSON.
 function makePollMock({ watchers, disruptionVerdict, evidenceVerdict }) {
   const calls = [];
   async function fn(options, body) {
     calls.push({ options, body });
     if (options.hostname === "api.anthropic.com") {
-      const isDisruptionCheck = typeof body === "string" && body.includes("FALSE PREMISE");
-      const verdict = isDisruptionCheck ? disruptionVerdict : evidenceVerdict;
+      // Single merged Oracle call: one JSON answers both questions.
+      const verdict = { ...evidenceVerdict, disrupted: disruptionVerdict.disrupted, disruption_reason: disruptionVerdict.reason };
       return {
         status: 200,
         headers: {},
@@ -52,6 +51,7 @@ function makePollMock({ watchers, disruptionVerdict, evidenceVerdict }) {
 function resetState() {
   server.locked.clear();
   server.lastChecked.clear();
+  server.sourceMemo.clear();
   for (const t of server.revealTimers.values()) clearTimeout(t);
   server.revealTimers.clear();
   server.__resetHttpRequest();

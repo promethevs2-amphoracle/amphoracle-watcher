@@ -8,6 +8,7 @@ const express = require("express");
 const cheerio = require("cheerio");
 const https = require("https");
 const http = require("http");
+const crypto = require("crypto");
 
 const { parseClaudeJSON } = require("./lib/parse-claude-json");
 const { decidePollInterval } = require("./lib/poll-interval");
@@ -20,7 +21,6 @@ const { createLogger } = require("./lib/logger");
 const { createMetrics } = require("./lib/metrics");
 const { extractUsage, recordUsage, estimatedCostUsd } = require("./lib/anthropic-usage");
 const { createCircuitBreaker, CircuitOpenError } = require("./lib/circuit-breaker");
-const { createCacheContext, withCache } = require("./lib/url-cache");
 
 const log = createLogger();
 const metrics = createMetrics();
@@ -56,10 +56,15 @@ const CONFIDENCE_THRESHOLD = 85; // Oracle locks when >= 85% confident
 const LOCK_TO_REVEAL_MS = 15 * 60 * 1000; // 15 minutes
 const POLL_INTERVAL_MS = 30 * 1000; // Poll every 30s
 const PER_WHISPER_CHECK_INTERVAL = 5 * 60 * 1000; // Check each whisper every 5 min
+// If the fetched sources are byte-identical to the last check, the Oracle
+// cannot say anything new — reuse the last answer instead of paying for a
+// model call. The memo expires so a stale page can never pin a whisper.
+const UNCHANGED_SOURCE_TTL_MS = 24 * 60 * 60 * 1000;
 
 const locked = new Map(); // whisper_id -> lock timestamp
 const lastChecked = new Map(); // whisper_id -> last check timestamp
 const revealTimers = new Map(); // whisper_id -> reveal timeout
+const sourceMemo = new Map(); // whisper_id -> { hash, result, at } from the last Oracle call
 
 // ─── HTTP HELPER ────────────────────────────────────────────
 function httpRequest(options, body) {
@@ -174,7 +179,7 @@ function fetchURL(url) {
 _fetchURL = fetchURL;
 
 // ─── CALL CLAUDE ─────────────────────────────────────────────
-const CLAUDE_MODEL = "claude-sonnet-4-5";
+const CLAUDE_MODEL = "claude-sonnet-5-5";
 
 async function callClaude(systemPrompt, userMessage, maxTokens = 800) {
   const body = JSON.stringify({
@@ -399,6 +404,86 @@ Has this prediction been conclusively answered? If confidence is below 85, set h
   return parsed;
 }
 
+// ─── ORACLE CHECK (single call) ───────────────────────────────
+// One model call answers both questions the two legacy checks asked
+// separately (can this still be verified? / has it been answered?).
+// Halves the per-check spend; checkForDisruption/checkForEvidence stay
+// for callers and tests that want them individually.
+function hashSources(fetchResults, whisper_title, oracle_hint) {
+  const h = crypto.createHash("sha256");
+  h.update(String(whisper_title)); h.update("\0"); h.update(String(oracle_hint || "")); h.update("\0");
+  for (const f of fetchResults) {
+    h.update(f.url); h.update("\0"); h.update(f.success ? String(f.content) : "<unavailable>"); h.update("\0");
+  }
+  return h.digest("hex");
+}
+
+async function checkWhisper(watcher, { fetchFn = _fetchURL, now = Date.now } = {}) {
+  const { whisper_id, whisper_title, urls, oracle_hint } = watcher;
+
+  const fetchResults = await Promise.all((urls || []).map(fetchFn));
+  const successCount = fetchResults.filter(f => f.success).length;
+  console.log(`[ORACLE] Checked ${successCount}/${fetchResults.length} sources for: "${whisper_title}"`);
+
+  const hash = hashSources(fetchResults, whisper_title, oracle_hint);
+  const memo = sourceMemo.get(whisper_id);
+  if (memo && memo.hash === hash && now() - memo.at < UNCHANGED_SOURCE_TTL_MS) {
+    metrics.inc("oracle_checks_skipped_unchanged");
+    console.log(`[ORACLE] Sources unchanged since last check — reusing answer for "${whisper_title}"`);
+    return { ...memo.result, unchanged: true };
+  }
+
+  const contentBlock = fetchResults
+    .map(f => f.success ? `--- SOURCE: ${f.url} ---\n${f.content}` : `--- SOURCE: ${f.url} --- UNAVAILABLE ---`)
+    .join("\n\n");
+
+  const systemPrompt = `You are the Oracle of Amphoracle. You check live sources to judge a binary prediction. Answer TWO questions in one pass.
+
+QUESTION 1 — Can this prediction still be verified? Two failure modes void a whisper:
+1. DISRUPTION: the event existed but was cancelled, postponed, withdrawn, halted, blocked, or otherwise prevented (weather, death, legal block, trading halt, etc.).
+2. FALSE PREMISE: no such event can be found in any reputable source — the prediction rests on an event that does not exist or is not scheduled. Absence of the event across all sources counts as a false premise (not "unknown").
+If a VERIFICATION HINT is provided, treat it as the EXPECTED VERIFICATION SOURCE — the authoritative place this event should appear. If sources matching the hint show no trace of the event, that strongly indicates a false premise.
+
+QUESTION 2 — Has the prediction been conclusively answered?
+- Only deliver a verdict if you find CONCLUSIVE evidence in the sources
+- If evidence is inconclusive or the event hasn't happened yet, say so clearly
+- Confidence must be >= 85 to lock a verdict
+- Treat the hint as the PRIORITY / EXPECTED SOURCE to check first, but base the verdict on evidence strength — if multiple independent authoritative sources contradict the hint source, do not lock a verdict; require corroboration.
+- Be extremely precise — this prediction will be revealed to thousands of seers
+
+Respond in JSON only, no markdown:
+{
+  "disrupted": true or false,
+  "disruption_reason": "If disrupted: one sentence in Oracle voice explaining what happened (disruption) OR that no such event can be found (false premise). If not disrupted: null",
+  "has_answer": true or false,
+  "verdict": "true" or "false" or "unverifiable",
+  "confidence": 0-100,
+  "reasoning": "2-3 sentences in dramatic Oracle voice explaining the verdict",
+  "evidence": "The specific fact found that proves the verdict"
+}`;
+
+  const userMessage = `WHISPER: "${whisper_title}"
+VERIFICATION HINT: ${oracle_hint || "Determine if this prediction came true based on the sources."}
+
+LIVE SOURCES:
+${contentBlock}
+
+If disrupted, set has_answer to false. If confidence is below 85, set has_answer to false.`;
+
+  const parsed = parseClaudeJSON(await callClaude(systemPrompt, userMessage));
+  const result = {
+    disrupted: !!parsed.disrupted,
+    reason: parsed.disruption_reason || parsed.reason || null,
+    has_answer: !!parsed.has_answer,
+    verdict: parsed.verdict,
+    confidence: parsed.confidence,
+    reasoning: parsed.reasoning,
+    evidence: parsed.evidence,
+  };
+  sourceMemo.set(whisper_id, { hash, result, at: now() });
+  return result;
+}
+
 // Shape a checkForEvidence result for a synchronous caller. Applies the
 // same confidence gate as the poll loop so a low-confidence "true" can
 // never settle a whisper on the Base44 side.
@@ -407,10 +492,18 @@ function toSyncVerdict(result) {
   const confidence = Number.isFinite(conf) ? Math.min(100, Math.max(0, conf)) : 0;
   const decisive = !!(result && result.has_answer) && confidence >= CONFIDENCE_THRESHOLD
     && ["true", "false"].includes(result.verdict);
-  const verdict = decisive ? result.verdict : "unverifiable";
-  const reasoning = String((result && result.reasoning) || "").trim()
+  const disrupted = !!(result && result.disrupted);
+  const verdict = decisive && !disrupted ? result.verdict : "unverifiable";
+  const reasoning = (disrupted && String(result.reason || "").trim())
+    || String((result && result.reasoning) || "").trim()
     || "The Oracle has not yet found a decisive answer in the sources.";
-  return { verdict, confidence, reasoning, evidence: (result && result.evidence) || null, has_answer: decisive };
+  return {
+    verdict, confidence, reasoning,
+    evidence: (result && result.evidence) || null,
+    has_answer: decisive && !disrupted,
+    disrupted,
+    unchanged: !!(result && result.unchanged),
+  };
 }
 
 // ─── LOCK WHISPER (Oracle found answer) ──────────────────────
@@ -502,6 +595,9 @@ function pruneState(activeWhisperIds) {
   let pruned = 0;
   for (const id of lastChecked.keys()) {
     if (!active.has(id)) { lastChecked.delete(id); pruned++; }
+  }
+  for (const id of sourceMemo.keys()) {
+    if (!active.has(id)) { sourceMemo.delete(id); pruned++; }
   }
   for (const id of locked.keys()) {
     if (!active.has(id) && !revealTimers.has(id)) {
@@ -623,17 +719,11 @@ async function pollWatchers() {
       lastChecked.set(watcher.whisper_id, Date.now());
 
       try {
-        // Share a per-watcher fetch cache so we don't double-fetch the
-        // same source URL across both Claude calls. checkForDisruption
-        // hits the first 2 URLs; checkForEvidence hits all of them —
-        // overlap is the common case.
-        const cache = createCacheContext();
-        const cachedFetch = withCache(_fetchURL, cache);
-        const [disruption, evidence] = await Promise.all([
-          checkForDisruption(watcher, { fetchFn: cachedFetch }),
-          checkForEvidence(watcher, { fetchFn: cachedFetch })
-        ]);
-        metrics.inc("fetch_cache_size", cache.size);
+        // One fetch pass, one model call (or none, if the sources are
+        // unchanged since the last check).
+        const check = await checkWhisper(watcher);
+        const disruption = { disrupted: check.disrupted, reason: check.reason };
+        const evidence = check;
 
         if (disruption.disrupted) {
           // Mark unverifiable with reason
@@ -740,8 +830,8 @@ app.post("/reveal", revealLimiter, requireAuth, async (req, res) => {
   res.json({ status: "checking" });
   const watcher = { id: watcher_id, whisper_id, whisper_title, urls: urls || [], oracle_hint };
   try {
-    const result = await checkForEvidence(watcher);
-    if (result.has_answer) {
+    const result = await checkWhisper(watcher);
+    if (result.has_answer && !result.disrupted) {
       await lockWhisper(watcher, result.verdict, result.confidence, result.reasoning, result.evidence);
     } else {
       console.log(`[MANUAL] No conclusive answer found for "${whisper_title}"`);
@@ -762,7 +852,7 @@ app.post("/verdict", revealLimiter, requireAuth, async (req, res) => {
   if (!whisper_id || !whisper_title) return res.status(400).json({ error: "Missing fields" });
   const watcher = { whisper_id, whisper_title, urls: Array.isArray(urls) ? urls : [], oracle_hint };
   try {
-    const result = await checkForEvidence(watcher);
+    const result = await checkWhisper(watcher);
     res.json(toSyncVerdict(result));
   } catch (e) {
     console.error("[VERDICT] Error:", e.message);
@@ -1011,6 +1101,8 @@ module.exports = {
   recoverRevealTimers,
   checkForDisruption,
   checkForEvidence,
+  checkWhisper,
+  hashSources,
   toSyncVerdict,
   lockWhisper,
   executeReveal,
@@ -1028,11 +1120,13 @@ module.exports = {
   locked,
   lastChecked,
   revealTimers,
+  sourceMemo,
   // constants
   CONFIDENCE_THRESHOLD,
   LOCK_TO_REVEAL_MS,
   POLL_INTERVAL_MS,
   PER_WHISPER_CHECK_INTERVAL,
+  UNCHANGED_SOURCE_TTL_MS,
   // middleware (for tests)
   scoutLimiter,
   revealLimiter,
