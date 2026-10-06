@@ -174,7 +174,7 @@ function fetchURL(url) {
 _fetchURL = fetchURL;
 
 // ─── CALL CLAUDE ─────────────────────────────────────────────
-const CLAUDE_MODEL = "claude-opus-4-6";
+const CLAUDE_MODEL = "claude-sonnet-4-5";
 
 async function callClaude(systemPrompt, userMessage, maxTokens = 800) {
   const body = JSON.stringify({
@@ -397,6 +397,20 @@ Has this prediction been conclusively answered? If confidence is below 85, set h
   const raw = await callClaude(systemPrompt, userMessage);
   const parsed = parseClaudeJSON(raw);
   return parsed;
+}
+
+// Shape a checkForEvidence result for a synchronous caller. Applies the
+// same confidence gate as the poll loop so a low-confidence "true" can
+// never settle a whisper on the Base44 side.
+function toSyncVerdict(result) {
+  const conf = Number(result && result.confidence);
+  const confidence = Number.isFinite(conf) ? Math.min(100, Math.max(0, conf)) : 0;
+  const decisive = !!(result && result.has_answer) && confidence >= CONFIDENCE_THRESHOLD
+    && ["true", "false"].includes(result.verdict);
+  const verdict = decisive ? result.verdict : "unverifiable";
+  const reasoning = String((result && result.reasoning) || "").trim()
+    || "The Oracle has not yet found a decisive answer in the sources.";
+  return { verdict, confidence, reasoning, evidence: (result && result.evidence) || null, has_answer: decisive };
 }
 
 // ─── LOCK WHISPER (Oracle found answer) ──────────────────────
@@ -737,6 +751,26 @@ app.post("/reveal", revealLimiter, requireAuth, async (req, res) => {
   }
 });
 
+// Synchronous verdict — the path Base44's oracleVerdict.ts calls.
+// Fetches the sources, asks the Oracle, and RETURNS the result. Writes
+// nothing: Base44 owns settlement (lock, ceremony, rewards), so this
+// endpoint never patches OracleWatcher or Whisper. Anything below the
+// confidence gate comes back as "unverifiable", which Base44 treats as
+// "not yet" and retries.
+app.post("/verdict", revealLimiter, requireAuth, async (req, res) => {
+  const { whisper_id, whisper_title, urls, oracle_hint } = req.body;
+  if (!whisper_id || !whisper_title) return res.status(400).json({ error: "Missing fields" });
+  const watcher = { whisper_id, whisper_title, urls: Array.isArray(urls) ? urls : [], oracle_hint };
+  try {
+    const result = await checkForEvidence(watcher);
+    res.json(toSyncVerdict(result));
+  } catch (e) {
+    console.error("[VERDICT] Error:", e.message);
+    log.error("verdict_error", { whisper_id, message: e.message });
+    res.status(502).json({ error: "Oracle check failed" });
+  }
+});
+
 // Date recommendation
 app.post("/recommend-date", recommendLimiter, requireAuth, async (req, res) => {
   const { whisper_title, category, symbol_or_topic } = req.body;
@@ -977,6 +1011,7 @@ module.exports = {
   recoverRevealTimers,
   checkForDisruption,
   checkForEvidence,
+  toSyncVerdict,
   lockWhisper,
   executeReveal,
   pollWatchers,
